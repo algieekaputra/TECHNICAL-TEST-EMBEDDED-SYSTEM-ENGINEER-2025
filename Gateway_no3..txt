@@ -1,0 +1,162 @@
+import mysql.connector
+import paho.mqtt.client as mqtt
+import json
+from datetime import datetime
+import threading
+import time
+
+# Database connection settings
+db_host = "localhost"  # Replace with your database host
+db_user = "root"       # Replace with your database username
+db_password = "password"  # Replace with your database password
+db_name = "sensor_data"  # Replace with your database name
+
+# MQTT broker settings
+mqtt_server = "5de3065f0ebb48d986135895199984d6.s2.eu.hivemq.cloud"
+mqtt_port = 8883
+mqtt_ws_port = 8884
+mqtt_topic = "DATA/ONLINE/SENSOR/PANEL_1"
+mqtt_client_id = "gateway1"
+mqtt_username = "embedded_test"
+mqtt_password = "Ravelware1402"
+
+# Create an MQTT client instance
+client = mqtt.Client(mqtt_client_id)
+client.username_pw_set(mqtt_username, mqtt_password)
+
+# Set the TLS/SSL options
+client.tls_set()  # This will use the default certificates to encrypt the communication
+client.tls_insecure_set(True)  # Allow insecure TLS connection (optional, can be removed for stricter security)
+
+# Callback when connected to MQTT broker
+def on_connect(client, userdata, flags, rc):
+    print(f"Connected to MQTT broker with result code {rc}")
+
+# Callback for handling messages
+def on_message(client, userdata, msg):
+    print(f"Received message: {msg.payload.decode()}")
+
+client.on_connect = on_connect
+client.on_message = on_message
+
+# Connect to the MQTT broker
+def connect_mqtt():
+    client.connect(mqtt_server, mqtt_port)
+    client.loop_start()  # Start the loop in a non-blocking way
+
+# Function to fetch data from the database
+def fetch_data_from_db():
+    try:
+        # Connect to MySQL database
+        connection = mysql.connector.connect(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name
+        )
+
+        cursor = connection.cursor()
+        cursor.execute("SELECT voltage, current, power, fan_status, temperature, timestamp FROM sensor_readings ORDER BY timestamp DESC LIMIT 1")
+
+        # Fetch the most recent data from the table
+        row = cursor.fetchone()
+
+        if row:
+            voltage, current, power, fan_status, temperature, timestamp = row
+            timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            return voltage, current, power, fan_status, temperature, timestamp
+        else:
+            return None, None, None, None, None, None
+
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        return None, None, None, None, None, None
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+# Function to create JSON payload
+def create_json_payload(voltage, current, power, fan_status, temperature, timestamp):
+    payload = {
+        "status": "OK",
+        "deviceID": "yourname",
+        "data": {
+            "v": str(voltage),
+            "i": str(current),
+            "pa": str(power),
+            "fan": str(fan_status),
+            "temp": str(temperature),
+            "time": timestamp
+        }
+    }
+    return json.dumps(payload)
+
+# Function to insert data into local database
+def save_data_locally(voltage, current, power, fan_status, temperature, timestamp):
+    try:
+        # Connect to MySQL database
+        connection = mysql.connector.connect(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name
+        )
+
+        cursor = connection.cursor()
+
+        # Insert the data into the local database
+        query = "INSERT INTO sensor_readings (voltage, current, power, fan_status, temperature, timestamp) VALUES (%s, %s, %s, %s, %s, %s)"
+        data = (voltage, current, power, fan_status, temperature, timestamp)
+        cursor.execute(query, data)
+        connection.commit()
+
+        print(f"Data saved locally: {data}")
+
+    except mysql.connector.Error as err:
+        print(f"Error saving data locally: {err}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+# Function to fetch and send data every interval
+def send_data_periodically(interval):
+    while True:
+        # Fetch the latest data from the database
+        voltage, current, power, fan_status, temperature, timestamp = fetch_data_from_db()
+
+        if voltage and current and power and fan_status and temperature and timestamp:
+            # Save data locally
+            save_data_locally(voltage, current, power, fan_status, temperature, timestamp)
+
+            # Create the JSON payload
+            payload = create_json_payload(voltage, current, power, fan_status, temperature, timestamp)
+
+            # Publish data to the MQTT topic
+            client.publish(mqtt_topic, payload)
+            print(f"Data sent to MQTT topic: {mqtt_topic}")
+
+        else:
+            print("No new data to send.")
+        
+        time.sleep(interval)  # Non-blocking interval (let MQTT loop continue)
+
+# Start the connection and data sending in separate threads
+def main():
+    connect_mqtt()
+
+    # Start sending data every 1 second
+    data_thread = threading.Thread(target=send_data_periodically, args=(1,))
+    data_thread.daemon = True  # This makes sure the thread will stop when the program ends
+    data_thread.start()
+
+    # Keep the main thread alive to allow MQTT client loop to run
+    try:
+        while True:
+            time.sleep(1)  # Main thread just sleeps while the MQTT client loop runs
+    except KeyboardInterrupt:
+        print("Program interrupted, shutting down...")
+
+if __name__ == "__main__":
+    main()
